@@ -1,0 +1,203 @@
+import simpy
+import random
+import statistics
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+
+wait_times = []
+
+
+class Theater(object):
+    def __init__(self, env, num_cashiers, num_servers, num_ushers):
+        self.env = env
+        self.cashier = simpy.Resource(env, num_cashiers)
+        self.server = simpy.Resource(env, num_servers)
+        self.usher = simpy.Resource(env, num_ushers)
+
+    def purchase_ticket(self, moviegoer):
+        yield self.env.timeout(random.randint(1, 3))
+
+    def check_ticket(self, moviegoer):
+        yield self.env.timeout(3 / 60)
+
+    def sell_food(self, moviegoer):
+        yield self.env.timeout(random.randint(1, 5))
+
+
+def go_to_movies(env, moviegoer, theater):
+    arrival_time = env.now
+
+    with theater.cashier.request() as request:
+        yield request
+        yield env.process(theater.purchase_ticket(moviegoer))
+
+    with theater.usher.request() as request:
+        yield request
+        yield env.process(theater.check_ticket(moviegoer))
+
+    if random.choice([True, False]):
+        with theater.server.request() as request:
+            yield request
+            yield env.process(theater.sell_food(moviegoer))
+
+    wait_times.append(env.now - arrival_time)
+
+
+def run_theater(env, num_cashiers, num_servers, num_ushers, moviegoer_count, update_callback):
+    theater = Theater(env, num_cashiers, num_servers, num_ushers)
+    for moviegoer in range(3):
+        env.process(go_to_movies(env, moviegoer, theater))
+
+    moviegoer = 2
+    while moviegoer < moviegoer_count:
+        yield env.timeout(0.20)
+        moviegoer += 1
+        env.process(go_to_movies(env, moviegoer, theater))
+        update_callback(moviegoer, env.now)
+
+
+def get_average_wait_time(wait_times):
+    """Calculate average wait time and convert to minutes and seconds."""
+    if not wait_times:
+        return 0, 0
+
+    average_wait = statistics.mean(wait_times)
+    minutes, frac_minutes = divmod(average_wait, 1)
+    seconds = frac_minutes * 60
+    return round(minutes), round(seconds)
+
+
+class TheaterSimulationGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Theater Simulation")
+        self.root.geometry("600x500")
+        self.simulation_running = False
+        
+        # Input Frame
+        input_frame = ttk.LabelFrame(root, text="Simulation Parameters", padding=10)
+        input_frame.pack(padx=10, pady=10, fill="x")
+        
+        ttk.Label(input_frame, text="Number of Cashiers:").grid(row=0, column=0, sticky="w", pady=5)
+        self.cashiers_var = tk.StringVar(value="1")
+        ttk.Entry(input_frame, textvariable=self.cashiers_var, width=10).grid(row=0, column=1, sticky="w", padx=5)
+        
+        ttk.Label(input_frame, text="Number of Servers:").grid(row=1, column=0, sticky="w", pady=5)
+        self.servers_var = tk.StringVar(value="1")
+        ttk.Entry(input_frame, textvariable=self.servers_var, width=10).grid(row=1, column=1, sticky="w", padx=5)
+        
+        ttk.Label(input_frame, text="Number of Ushers:").grid(row=2, column=0, sticky="w", pady=5)
+        self.ushers_var = tk.StringVar(value="1")
+        ttk.Entry(input_frame, textvariable=self.ushers_var, width=10).grid(row=2, column=1, sticky="w", padx=5)
+        
+        ttk.Label(input_frame, text="Number of Moviegoers:").grid(row=3, column=0, sticky="w", pady=5)
+        self.moviegoers_var = tk.StringVar(value="10")
+        ttk.Entry(input_frame, textvariable=self.moviegoers_var, width=10).grid(row=3, column=1, sticky="w", padx=5)
+        
+        # Button Frame
+        button_frame = ttk.Frame(root)
+        button_frame.pack(padx=10, pady=5, fill="x")
+        
+        self.run_button = ttk.Button(button_frame, text="Run Simulation", command=self.run_simulation)
+        self.run_button.pack(side="left", padx=5)
+        
+        self.clear_button = ttk.Button(button_frame, text="Clear Results", command=self.clear_results)
+        self.clear_button.pack(side="left", padx=5)
+        
+        # Status Frame
+        status_frame = ttk.LabelFrame(root, text="Simulation Status", padding=10)
+        status_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        
+        ttk.Label(status_frame, text="Current Moviegoers Processed:").pack(anchor="w")
+        self.moviegoers_label = ttk.Label(status_frame, text="0", font=("Arial", 14, "bold"))
+        self.moviegoers_label.pack(anchor="w", padx=20)
+        
+        ttk.Label(status_frame, text="Simulation Time:").pack(anchor="w", pady=(10, 0))
+        self.time_label = ttk.Label(status_frame, text="0.00 seconds", font=("Arial", 14, "bold"))
+        self.time_label.pack(anchor="w", padx=20)
+        
+        # Results Frame
+        results_frame = ttk.LabelFrame(root, text="Results", padding=10)
+        results_frame.pack(padx=10, pady=10, fill="both")
+        
+        ttk.Label(results_frame, text="Average Wait Time:").pack(anchor="w")
+        self.result_label = ttk.Label(results_frame, text="", font=("Arial", 12, "bold"), foreground="green")
+        self.result_label.pack(anchor="w", padx=20)
+    
+    def update_status(self, moviegoer_count, sim_time):
+        """Update the GUI with simulation progress."""
+        self.moviegoers_label.config(text=str(moviegoer_count))
+        self.time_label.config(text=f"{sim_time:.2f} seconds")
+        self.root.update_idletasks()
+    
+    def run_simulation(self):
+        """Run the simulation in a separate thread."""
+        if self.simulation_running:
+            messagebox.showwarning("Warning", "Simulation is already running!")
+            return
+        
+        try:
+            num_cashiers = int(self.cashiers_var.get())
+            num_servers = int(self.servers_var.get())
+            num_ushers = int(self.ushers_var.get())
+            num_moviegoers = int(self.moviegoers_var.get())
+            
+            if num_cashiers <= 0 or num_servers <= 0 or num_ushers <= 0 or num_moviegoers <= 0:
+                messagebox.showerror("Error", "All values must be positive integers!")
+                return
+        except ValueError:
+            messagebox.showerror("Error", "Please enter valid integers!")
+            return
+        
+        self.simulation_running = True
+        self.run_button.config(state="disabled")
+        self.result_label.config(text="Running...")
+        
+        # Run simulation in a separate thread
+        thread = threading.Thread(target=self.simulation_thread, args=(num_cashiers, num_servers, num_ushers, num_moviegoers))
+        thread.daemon = True
+        thread.start()
+    
+    def simulation_thread(self, num_cashiers, num_servers, num_ushers, num_moviegoers):
+        """Run the simulation in a background thread."""
+        global wait_times
+        wait_times = []
+        
+        random.seed(42)
+        env = simpy.Environment()
+        env.process(run_theater(env, num_cashiers, num_servers, num_ushers, num_moviegoers, self.update_status))
+        env.run(until=90)
+        
+        # Calculate results
+        mins, secs = get_average_wait_time(wait_times)
+        result_text = f"{mins} minutes and {secs} seconds"
+        
+        # Update GUI with results
+        self.root.after(0, self.display_results, result_text)
+        self.simulation_running = False
+        self.run_button.config(state="normal")
+    
+    def display_results(self, result_text):
+        """Display the simulation results."""
+        self.result_label.config(text=result_text, foreground="green")
+    
+    def clear_results(self):
+        """Clear all results."""
+        self.cashiers_var.set("1")
+        self.servers_var.set("1")
+        self.ushers_var.set("1")
+        self.moviegoers_var.set("10")
+        self.moviegoers_label.config(text="0")
+        self.time_label.config(text="0.00 seconds")
+        self.result_label.config(text="")
+
+
+def main():
+    root = tk.Tk()
+    gui = TheaterSimulationGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
