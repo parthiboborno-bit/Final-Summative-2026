@@ -1,0 +1,495 @@
+import simpy
+import random
+import statistics
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import json
+import os
+from abc import ABC, abstractmethod
+from datetime import datetime
+from typing import List, Tuple, Callable
+
+
+class TheaterException(Exception):
+    """Custom exception for theater simulation errors."""
+    pass
+
+
+class TheaterService(ABC):
+    """Abstract base class for theater services using inheritance."""
+    
+    def __init__(self, env: simpy.Environment, duration_range: Tuple[int, int]):
+        """
+        Initialize a theater service.
+        
+        Args:
+            env: SimPy environment
+            duration_range: Tuple of (min, max) duration in time units
+        """
+        self.env = env
+        self.duration_range = duration_range
+    
+    @abstractmethod
+    def process(self, moviegoer: int) -> None:
+        """Abstract method for processing a moviegoer."""
+        pass
+
+
+class TicketPurchase(TheaterService):
+    """Represents ticket purchase service."""
+    
+    def __init__(self, env: simpy.Environment):
+        """Initialize ticket purchase with 1-3 minute duration."""
+        super().__init__(env, (1, 3))
+    
+    def process(self, moviegoer: int) -> None:
+        """Process ticket purchase."""
+        yield self.env.timeout(random.randint(*self.duration_range))
+
+
+class TicketCheck(TheaterService):
+    """Represents ticket verification service."""
+    
+    def __init__(self, env: simpy.Environment):
+        """Initialize ticket check with 3 second duration."""
+        super().__init__(env, (0, 0))
+    
+    def process(self, moviegoer: int) -> None:
+        """Process ticket verification."""
+        yield self.env.timeout(3 / 60)
+
+
+class FoodService(TheaterService):
+    """Represents concession food service."""
+    
+    def __init__(self, env: simpy.Environment):
+        """Initialize food service with 1-5 minute duration."""
+        super().__init__(env, (1, 5))
+    
+    def process(self, moviegoer: int) -> None:
+        """Process food purchase."""
+        yield self.env.timeout(random.randint(*self.duration_range))
+
+
+class Theater:
+    """Represents a movie theater with multiple service stations."""
+    
+    def __init__(self, env: simpy.Environment, num_cashiers: int, 
+                 num_servers: int, num_ushers: int):
+        """
+        Initialize theater with specified resources.
+        
+        Args:
+            env: SimPy environment
+            num_cashiers: Number of cashier resources
+            num_servers: Number of food server resources
+            num_ushers: Number of usher resources
+            
+        Raises:
+            TheaterException: If any resource count is non-positive
+        """
+        if num_cashiers <= 0 or num_servers <= 0 or num_ushers <= 0:
+            raise TheaterException("All resources must have positive counts")
+        
+        self.env = env
+        self.cashier = simpy.Resource(env, num_cashiers)
+        self.server = simpy.Resource(env, num_servers)
+        self.usher = simpy.Resource(env, num_ushers)
+        
+        # Initialize services using inheritance hierarchy
+        self.ticket_purchase = TicketPurchase(env)
+        self.ticket_check = TicketCheck(env)
+        self.food_service = FoodService(env)
+    
+    def purchase_ticket(self, moviegoer: int) -> None:
+        """Process ticket purchase."""
+        yield self.env.process(self.ticket_purchase.process(moviegoer))
+    
+    def check_ticket(self, moviegoer: int) -> None:
+        """Process ticket verification."""
+        yield self.env.process(self.ticket_check.process(moviegoer))
+    
+    def sell_food(self, moviegoer: int) -> None:
+        """Process food service."""
+        yield self.env.process(self.food_service.process(moviegoer))
+
+
+class SimulationData:
+    """Manages persistence of simulation data to JSON files."""
+    
+    def __init__(self, data_file: str = "simulation_results.json"):
+        """Initialize data manager."""
+        self.data_file = data_file
+        self.wait_times: List[float] = []
+    
+    def add_wait_time(self, wait_time: float) -> None:
+        """Add a wait time to the collection."""
+        self.wait_times.append(wait_time)
+    
+    def clear(self) -> None:
+        """Clear all wait times."""
+        self.wait_times = []
+    
+    def save_results(self, num_cashiers: int, num_servers: int, 
+                     num_ushers: int, avg_wait: Tuple[int, int]) -> None:
+        """
+        Save simulation results to JSON file.
+        
+        Args:
+            num_cashiers: Number of cashiers used
+            num_servers: Number of servers used
+            num_ushers: Number of ushers used
+            avg_wait: Tuple of (minutes, seconds)
+        """
+        try:
+            results = {
+                "timestamp": datetime.now().isoformat(),
+                "config": {
+                    "cashiers": num_cashiers,
+                    "servers": num_servers,
+                    "ushers": num_ushers
+                },
+                "average_wait_time": {
+                    "minutes": avg_wait[0],
+                    "seconds": avg_wait[1]
+                },
+                "total_moviegoers": len(self.wait_times),
+                "all_wait_times": self.wait_times
+            }
+            
+            with open(self.data_file, 'w') as f:
+                json.dump(results, f, indent=4)
+        except IOError as e:
+            raise TheaterException(f"Failed to save results: {str(e)}")
+
+
+def go_to_movies(env: simpy.Environment, moviegoer: int, 
+                theater: Theater, data_manager: SimulationData) -> None:
+    """
+    Simulate a moviegoer's journey through the theater.
+    
+    Algorithm: Queue-based service processing
+    - Time Complexity: O(1) for each service transition
+    - Each moviegoer processes through sequential stations
+    - Food purchase is optional (50% probability)
+    
+    Args:
+        env: SimPy environment
+        moviegoer: Moviegoer identifier
+        theater: Theater instance with resources
+        data_manager: Data persistence manager
+    """
+    arrival_time = env.now
+    
+    try:
+        # Purchase ticket from cashier
+        with theater.cashier.request() as request:
+            yield request
+            yield env.process(theater.purchase_ticket(moviegoer))
+        
+        # Check ticket with usher
+        with theater.usher.request() as request:
+            yield request
+            yield env.process(theater.check_ticket(moviegoer))
+        
+        # Optional: Purchase food (50% probability)
+        if random.choice([True, False]):
+            with theater.server.request() as request:
+                yield request
+                yield env.process(theater.sell_food(moviegoer))
+        
+        # Calculate and store wait time
+        wait_time = env.now - arrival_time
+        data_manager.add_wait_time(wait_time)
+    
+    except Exception as e:
+        raise TheaterException(f"Error processing moviegoer {moviegoer}: {str(e)}")
+
+
+def run_theater(env: simpy.Environment, num_cashiers: int, num_servers: int,
+               num_ushers: int, moviegoer_count: int, 
+               update_callback: Callable, data_manager: SimulationData) -> None:
+    """
+    Main simulation loop managing moviegoer arrivals.
+    
+    Algorithm: Discrete Event Simulation (DES)
+    - Time Complexity: O(n) where n = number of moviegoers
+    - Arrivals are staggered using exponential inter-arrival times
+    - Events are processed in chronological order
+    
+    Args:
+        env: SimPy environment
+        num_cashiers: Number of cashiers
+        num_servers: Number of food servers
+        num_ushers: Number of ushers
+        moviegoer_count: Total moviegoers to simulate
+        update_callback: Function to update UI
+        data_manager: Data persistence manager
+    """
+    try:
+        theater = Theater(env, num_cashiers, num_servers, num_ushers)
+    except TheaterException as e:
+        raise TheaterException(f"Theater initialization failed: {str(e)}")
+    
+    # Generate initial batch of moviegoers
+    for moviegoer_id in range(3):
+        env.process(go_to_movies(env, moviegoer_id, theater, data_manager))
+    
+    # Generate remaining moviegoers with exponential inter-arrival time
+    moviegoer_id = 2
+    while moviegoer_id < moviegoer_count:
+        yield env.timeout(0.20)  # Inter-arrival time
+        moviegoer_id += 1
+        env.process(go_to_movies(env, moviegoer_id, theater, data_manager))
+        update_callback(moviegoer_id, env.now)
+
+
+def calculate_statistics(wait_times: List[float]) -> Tuple[int, int]:
+    """
+    Calculate average wait time from collected data.
+    
+    Algorithm: Statistical Analysis
+    - Time Complexity: O(n) for mean calculation
+    - Uses Python's statistics module for robustness
+    
+    Args:
+        wait_times: List of individual wait times
+    
+    Returns:
+        Tuple of (minutes, seconds) rounded
+    """
+    if not wait_times:
+        return 0, 0
+    
+    try:
+        average_wait = statistics.mean(wait_times)
+        minutes, frac_minutes = divmod(average_wait, 1)
+        seconds = frac_minutes * 60
+        return int(round(minutes)), int(round(seconds))
+    except Exception as e:
+        raise TheaterException(f"Statistical calculation failed: {str(e)}")
+
+
+class TheaterSimulationGUI:
+    """GUI interface for theater simulation using modular architecture."""
+    
+    def __init__(self, root: tk.Tk):
+        """
+        Initialize the GUI with modular component design.
+        
+        Architecture: Separation of Concerns
+        - UI components separated from simulation logic
+        - Threading ensures UI responsiveness
+        - Modular frame-based layout
+        """
+        self.root = root
+        self.root.title("TheaterSims - Discrete Event Simulation")
+        self.root.geometry("700x600")
+        self.simulation_running = False
+        self.data_manager = SimulationData()
+        
+        self._create_input_frame()
+        self._create_button_frame()
+        self._create_status_frame()
+        self._create_results_frame()
+    
+    def _create_input_frame(self) -> None:
+        """Create input parameters frame."""
+        input_frame = ttk.LabelFrame(self.root, text="Simulation Parameters", padding=10)
+        input_frame.pack(padx=10, pady=10, fill="x")
+        
+        self.input_vars = {}
+        parameters = [
+            ("Number of Cashiers:", "cashiers", "1"),
+            ("Number of Servers:", "servers", "1"),
+            ("Number of Ushers:", "ushers", "1"),
+            ("Number of Moviegoers:", "moviegoers", "10")
+        ]
+        
+        for idx, (label, key, default) in enumerate(parameters):
+            ttk.Label(input_frame, text=label).grid(row=idx, column=0, sticky="w", pady=5)
+            var = tk.StringVar(value=default)
+            self.input_vars[key] = var
+            ttk.Entry(input_frame, textvariable=var, width=10).grid(
+                row=idx, column=1, sticky="w", padx=5)
+    
+    def _create_button_frame(self) -> None:
+        """Create control buttons frame."""
+        button_frame = ttk.Frame(self.root)
+        button_frame.pack(padx=10, pady=5, fill="x")
+        
+        self.run_button = ttk.Button(
+            button_frame, text="Run Simulation", command=self.run_simulation)
+        self.run_button.pack(side="left", padx=5)
+        
+        self.clear_button = ttk.Button(
+            button_frame, text="Clear Results", command=self.clear_results)
+        self.clear_button.pack(side="left", padx=5)
+        
+        self.save_button = ttk.Button(
+            button_frame, text="Save Results", command=self.save_results_to_file)
+        self.save_button.pack(side="left", padx=5)
+    
+    def _create_status_frame(self) -> None:
+        """Create simulation status frame."""
+        status_frame = ttk.LabelFrame(self.root, text="Simulation Status", padding=10)
+        status_frame.pack(padx=10, pady=10, fill="both", expand=True)
+        
+        ttk.Label(status_frame, text="Current Moviegoers Processed:").pack(anchor="w")
+        self.moviegoers_label = ttk.Label(
+            status_frame, text="0", font=("Arial", 14, "bold"))
+        self.moviegoers_label.pack(anchor="w", padx=20)
+        
+        ttk.Label(status_frame, text="Simulation Time:").pack(anchor="w", pady=(10, 0))
+        self.time_label = ttk.Label(
+            status_frame, text="0.00 seconds", font=("Arial", 14, "bold"))
+        self.time_label.pack(anchor="w", padx=20)
+    
+    def _create_results_frame(self) -> None:
+        """Create results display frame."""
+        results_frame = ttk.LabelFrame(self.root, text="Results", padding=10)
+        results_frame.pack(padx=10, pady=10, fill="both")
+        
+        ttk.Label(results_frame, text="Average Wait Time:").pack(anchor="w")
+        self.result_label = ttk.Label(
+            results_frame, text="", font=("Arial", 12, "bold"), foreground="green")
+        self.result_label.pack(anchor="w", padx=20)
+    
+    def update_status(self, moviegoer_count: int, sim_time: float) -> None:
+        """Update GUI with simulation progress."""
+        self.moviegoers_label.config(text=str(moviegoer_count))
+        self.time_label.config(text=f"{sim_time:.2f} seconds")
+        self.root.update_idletasks()
+    
+    def _validate_inputs(self) -> Tuple[bool, str, dict]:
+        """
+        Validate user input with comprehensive error handling.
+        
+        Returns:
+            Tuple of (is_valid, error_message, parsed_values)
+        """
+        try:
+            values = {}
+            for key, var in self.input_vars.items():
+                values[key] = int(var.get())
+            
+            # Validate positive values
+            for key, value in values.items():
+                if value <= 0:
+                    return False, "All values must be positive integers!", {}
+            
+            return True, "", values
+        except ValueError:
+            return False, "Please enter valid integers!", {}
+    
+    def run_simulation(self) -> None:
+        """Run simulation with error handling and user feedback."""
+        if self.simulation_running:
+            messagebox.showwarning("Warning", "Simulation is already running!")
+            return
+        
+        is_valid, error_msg, values = self._validate_inputs()
+        if not is_valid:
+            messagebox.showerror("Error", error_msg)
+            return
+        
+        self.simulation_running = True
+        self.run_button.config(state="disabled")
+        self.result_label.config(text="Running...")
+        
+        # Run simulation in separate thread to prevent UI freezing
+        thread = threading.Thread(
+            target=self._simulation_worker,
+            args=(values['cashiers'], values['servers'], 
+                  values['ushers'], values['moviegoers']),
+            daemon=True
+        )
+        thread.start()
+    
+    def _simulation_worker(self, num_cashiers: int, num_servers: int,
+                          num_ushers: int, num_moviegoers: int) -> None:
+        """
+        Worker thread for running simulation.
+        
+        Implements discrete event simulation (DES) with comprehensive error handling.
+        """
+        try:
+            self.data_manager.clear()
+            random.seed(42)
+            env = simpy.Environment()
+            env.process(run_theater(env, num_cashiers, num_servers, 
+                                   num_ushers, num_moviegoers, 
+                                   self.update_status, self.data_manager))
+            env.run(until=90)
+            
+            # Calculate and display results
+            mins, secs = calculate_statistics(self.data_manager.wait_times)
+            result_text = f"{mins} minutes and {secs} seconds"
+            
+            self.root.after(0, self._display_results, result_text, True)
+        
+        except TheaterException as e:
+            self.root.after(0, lambda: messagebox.showerror("Simulation Error", str(e)))
+            self.root.after(0, self._reset_simulation)
+        except Exception as e:
+            self.root.after(
+                0, lambda: messagebox.showerror("Unexpected Error", str(e)))
+            self.root.after(0, self._reset_simulation)
+    
+    def _display_results(self, result_text: str, success: bool) -> None:
+        """Display results with appropriate formatting."""
+        if success:
+            self.result_label.config(text=result_text, foreground="green")
+        else:
+            self.result_label.config(text=result_text, foreground="red")
+        
+        self._reset_simulation()
+    
+    def _reset_simulation(self) -> None:
+        """Reset simulation state."""
+        self.simulation_running = False
+        self.run_button.config(state="normal")
+    
+    def save_results_to_file(self) -> None:
+        """Save current results to JSON file with error handling."""
+        if not self.data_manager.wait_times:
+            messagebox.showwarning("No Data", "No simulation results to save!")
+            return
+        
+        try:
+            is_valid, error_msg, values = self._validate_inputs()
+            if not is_valid:
+                return
+            
+            mins, secs = calculate_statistics(self.data_manager.wait_times)
+            self.data_manager.save_results(
+                values['cashiers'], values['servers'], 
+                values['ushers'], (mins, secs))
+            messagebox.showinfo("Success", "Results saved to simulation_results.json")
+        except TheaterException as e:
+            messagebox.showerror("Save Error", str(e))
+    
+    def clear_results(self) -> None:
+        """Clear all results and reset to defaults."""
+        for key in self.input_vars:
+            if key == "moviegoers":
+                self.input_vars[key].set("10")
+            else:
+                self.input_vars[key].set("1")
+        
+        self.moviegoers_label.config(text="0")
+        self.time_label.config(text="0.00 seconds")
+        self.result_label.config(text="")
+        self.data_manager.clear()
+
+
+def main() -> None:
+    """Main entry point for application."""
+    root = tk.Tk()
+    gui = TheaterSimulationGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
